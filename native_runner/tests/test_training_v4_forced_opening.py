@@ -71,4 +71,8 @@ def test_ppo_forced_act_uses_conditional_behavior_probability() -> None:
         validate=False,
     )
 
-    assert metrics[0]["approx_kl"] == pytest.approx(0.0, abs=1e-6)
+    # approx_kl is the mean of -log_ratio, i.e. a float32 log-prob difference of a
+    # value around -12; one float32 ulp there is ~1e-6, and CPUs with other SIMD
+    # kernels (e.g. GitHub's runners) land 2 ulp away. A real mismatch between
+    # behaviour and conditional probabilities would be orders of magnitude larger.
+    assert metrics[0]["approx_kl"] == pytest.approx(0.0, abs=1e-5)
