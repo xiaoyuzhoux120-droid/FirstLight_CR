@@ -226,6 +226,48 @@ def _delay_neighbor_smoothed_nll(
     return -(target_weights * log_probs).sum(dim=-1)
 
 
+def il_loss_masks(sequence: ILSequenceV4) -> dict[str, Tensor]:
+    """Per-head supervision masks; they depend on the expert labels only.
+
+    Because the populations never depend on the model output, callers can
+    compute them before a forward pass, e.g. to normalize micro-batches.
+    """
+
+    max_micro_actions = sequence.actions[0].candidate_index.shape[1]
+    micro_counts = torch.stack([item.micro_action_count for item in sequence.actions])
+    micro_mask = (
+        torch.arange(max_micro_actions, device=micro_counts.device)[None, None, :] < micro_counts[:, :, None]
+    ) & sequence.valid_mask[:, :, None]
+    target_cells = torch.stack([item.target_cell for item in sequence.actions])
+    gates = torch.stack([item.gate for item in sequence.actions])
+    return {
+        "micro": micro_mask,
+        "grid": micro_mask & (target_cells >= 0),
+        "act": sequence.valid_mask & (gates == GATE_ACT),
+        "gate": sequence.valid_mask if sequence.gate_loss_mask is None else sequence.gate_loss_mask,
+        "value": sequence.valid_mask if sequence.value_loss_mask is None else sequence.value_loss_mask,
+        "gates": gates,
+        "delay_bins": torch.stack([item.delay_offset_bin for item in sequence.actions]),
+    }
+
+
+IL_LOSS_HEADS = (
+    ("gate", "gate_count", "gate"),
+    ("candidate", "candidate_count", "micro"),
+    ("target", "target_count", "grid"),
+    ("delay", "delay_count", "micro"),
+    ("continue_action", "continue_count", "act"),
+    ("value", "value_count", "value"),
+)
+
+
+def il_loss_counts(sequence: ILSequenceV4) -> Tensor:
+    """Float32 ``[6]`` populations in :data:`IL_LOSS_HEADS` order, without a forward pass."""
+
+    masks = il_loss_masks(sequence)
+    return torch.stack([masks[mask_name].sum().to(torch.float32) for _loss, _count, mask_name in IL_LOSS_HEADS])
+
+
 def imitation_loss(
     sequence: ILSequenceV4,
     evaluation: RecurrentEvaluationV4,
@@ -243,17 +285,13 @@ def imitation_loss(
     if tuple(evaluation.value.shape) != (time_steps, batch_size):
         raise ValueError("IL evaluation has the wrong [T,B] shape")
     components = evaluation.components
-    max_micro_actions = sequence.actions[0].candidate_index.shape[1]
-    micro_counts = torch.stack([item.micro_action_count for item in sequence.actions])
-    micro_mask = (
-        torch.arange(max_micro_actions, device=micro_counts.device)[None, None, :] < micro_counts[:, :, None]
-    ) & sequence.valid_mask[:, :, None]
-    target_cells = torch.stack([item.target_cell for item in sequence.actions])
-    delay_bins = torch.stack([item.delay_offset_bin for item in sequence.actions])
-    grid_mask = micro_mask & (target_cells >= 0)
-    gates = torch.stack([item.gate for item in sequence.actions])
-    act_mask = sequence.valid_mask & (gates == GATE_ACT)
-    gate_mask = sequence.valid_mask if sequence.gate_loss_mask is None else sequence.gate_loss_mask
+    masks = il_loss_masks(sequence)
+    micro_mask = masks["micro"]
+    grid_mask = masks["grid"]
+    act_mask = masks["act"]
+    gate_mask = masks["gate"]
+    gates = masks["gates"]
+    delay_bins = masks["delay_bins"]
 
     gate, gate_count = _masked_gate_mean(-components.gate_log_prob, gate_mask, gates, act_weight=gate_act_weight)
     candidate, candidate_count = _masked_mean(-components.candidate_log_prob, micro_mask)
@@ -276,9 +314,7 @@ def imitation_loss(
         raw_value_loss = (evaluation.value - sequence.returns.to(evaluation.value.dtype)).square()
     else:
         raise ValueError("value_loss must be 'huber' or 'mse'")
-    value, value_count = _masked_mean(
-        raw_value_loss, (sequence.valid_mask if sequence.value_loss_mask is None else sequence.value_loss_mask)
-    )
+    value, value_count = _masked_mean(raw_value_loss, masks["value"])
 
     total = (
         actual_weights.gate * gate
