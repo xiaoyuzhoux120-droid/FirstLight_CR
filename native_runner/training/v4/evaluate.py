@@ -1,9 +1,10 @@
 """Evaluate two checkpoints in complete, sequential offline native matches."""
 
 import argparse
-from dataclasses import asdict, replace
 import json
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -12,9 +13,115 @@ from ...contracts import ActionKind, ActionV1
 from ...cr_native_env import DEFAULT_HOST, DEFAULT_PORT, NativeClashEnv
 from ...match_factory import MatchConfig
 from ...rich_telemetry_adapter import RuntimeEffectCatalog
+from .eval_stats import build_report
 from .expert import FIRST_POLICY_DECISION_TICK, POLICY_DECISION_TICKS
 from .factory import production_semantic_bundle
 from .policy_session import build_policy_session_v4, load_policy_v4
+
+FULL_ELIXIR = 10.0
+
+
+@dataclass(frozen=True, slots=True)
+class MatchOutcome:
+    terminal: Any
+    terminated: bool
+    truncated: bool
+    tick: int
+    actions_by_owner: list[int]
+    rejected_actions: int
+    first_action_tick_by_owner: list[int | None]
+    full_elixir_ticks_by_owner: list[int]
+    forced_actions_by_owner: list[int]
+
+
+def _own_elixir(observation, owner):
+    for player in observation.players:
+        if player.owner == owner:
+            return player.elixir_exact
+    return None
+
+
+def play_match(
+    environment, models_by_owner, match, *, device="cpu", sample=False, force_first_action_tick=None, on_sessions=None
+):
+    """Play one complete headless match and return its outcome and behaviour metrics.
+
+    ``models_by_owner`` maps engine owner 0/1 to a loaded model.  When
+    ``force_first_action_tick`` is set, a side that has not played any card by
+    that tick is forced to act once (the historical IL-evaluation protocol).
+    ``on_sessions`` receives the built sessions so that a caller can end them if
+    the match raises.  Sessions are ended here on normal completion.
+    """
+
+    torch.manual_seed(match.seed)
+    observations, _ = environment.reset(
+        match_config=match,
+        options={
+            "render_mode": "headless",
+            "decision_ticks": POLICY_DECISION_TICKS,
+            "event_driven_decisions": False,
+            "allow_initial_remaining_runtime_rejections": True,
+        },
+    )
+    initial_elixir = {owner: _own_elixir(obs, owner) for owner, obs in observations.items()}
+    sessions = [
+        build_policy_session_v4(environment, models_by_owner[owner], actor_owner=owner, device=device, sample=sample)
+        for owner in (0, 1)
+    ]
+    if on_sessions is not None:
+        on_sessions(sessions)
+    for owner, session in enumerate(sessions):
+        session.start_episode(observations[owner], initial_elixir=initial_elixir)
+    actions = [0, 0]
+    forced_actions = [0, 0]
+    first_action: list[int | None] = [None, None]
+    full_elixir_ticks = [0, 0]
+    rejected = set()
+    terminated = truncated = False
+    while not terminated and not truncated:
+        commands = {}
+        for owner, session in enumerate(sessions):
+            observation = observations[owner]
+            chosen = ()
+            if observation.tick >= FIRST_POLICY_DECISION_TICK:
+                force = (
+                    force_first_action_tick is not None
+                    and first_action[owner] is None
+                    and observation.tick >= force_first_action_tick
+                )
+                decision = session.decide(observation, force_act=True) if force else session.decide(observation)
+                chosen = decision.decoded.actions
+                played = sum(a.kind != ActionKind.WAIT for a in chosen)
+                actions[owner] += played
+                if force:
+                    forced_actions[owner] += played
+                if played and first_action[owner] is None:
+                    first_action[owner] = int(observation.tick)
+                elixir = _own_elixir(observation, owner)
+                if elixir is not None and elixir >= FULL_ELIXIR:
+                    full_elixir_ticks[owner] += POLICY_DECISION_TICKS
+            else:
+                session.tensorizer.tensorize(observation, validate=False)
+            commands[owner] = tuple(chosen) or (ActionV1.wait(owner, ticks=POLICY_DECISION_TICKS),)
+        observations, _, terms, truncs, _ = environment.step(commands, record_trace=False)
+        terminated, truncated = bool(terms["__all__"]), bool(truncs["__all__"])
+        for observation in observations.values():
+            for event in observation.events:
+                if event.event_type == "action_rejected":
+                    rejected.add(json.dumps(event.to_dict(), sort_keys=True))
+    for session in sessions:
+        session.end_episode()
+    return MatchOutcome(
+        terminal=observations[0].terminal,
+        terminated=terminated,
+        truncated=truncated,
+        tick=int(observations[0].tick),
+        actions_by_owner=actions,
+        rejected_actions=len(rejected),
+        first_action_tick_by_owner=first_action,
+        full_elixir_ticks_by_owner=full_elixir_ticks,
+        forced_actions_by_owner=forced_actions,
+    )
 
 
 def evaluate(
@@ -28,6 +135,7 @@ def evaluate(
     port=DEFAULT_PORT,
     device="cpu",
     sample=False,
+    force_first_action_tick=None,
 ):
     if games < 1:
         raise ValueError("games must be positive")
@@ -46,6 +154,7 @@ def evaluate(
     identity = {
         "games": games,
         "sample": sample,
+        "force_first_action_tick": force_first_action_tick,
         "match": asdict(match),
         "checkpoints": [
             {"path": str(p.checkpoint_path), "sha256": p.checkpoint_sha256, "checkpoint_id": p.checkpoint_id}
@@ -70,53 +179,19 @@ def evaluate(
                         tower_troop0_id=match.tower_troop1_id,
                         tower_troop1_id=match.tower_troop0_id,
                     )
-                torch.manual_seed(current.seed)
-                observations, _ = environment.reset(
-                    match_config=current,
-                    options={
-                        "render_mode": "headless",
-                        "decision_ticks": POLICY_DECISION_TICKS,
-                        "event_driven_decisions": False,
-                        "allow_initial_remaining_runtime_rejections": True,
-                    },
+                sessions = []  # filled by play_match so ``finally`` can end them on failure
+                outcome = play_match(
+                    environment,
+                    {owner: policies[0 if owner == a_owner else 1].model for owner in (0, 1)},
+                    current,
+                    device=device,
+                    sample=sample,
+                    force_first_action_tick=force_first_action_tick,
+                    on_sessions=sessions.extend,
                 )
-                initial_elixir = {
-                    owner: next(p.elixir_exact for p in obs.players if p.owner == owner)
-                    for owner, obs in observations.items()
-                }
-                sessions = [
-                    build_policy_session_v4(
-                        environment,
-                        policies[0 if owner == a_owner else 1].model,
-                        actor_owner=owner,
-                        device=device,
-                        sample=sample,
-                    )
-                    for owner in (0, 1)
-                ]
-                for owner, session in enumerate(sessions):
-                    session.start_episode(observations[owner], initial_elixir=initial_elixir)
-                actions = [0, 0]
-                rejected = set()
-                terminated = truncated = False
-                while not terminated and not truncated:
-                    commands = {}
-                    for owner, session in enumerate(sessions):
-                        observation = observations[owner]
-                        chosen = ()
-                        if observation.tick >= FIRST_POLICY_DECISION_TICK:
-                            chosen = session.decide(observation).decoded.actions
-                            actions[owner] += sum(a.kind != ActionKind.WAIT for a in chosen)
-                        else:
-                            session.tensorizer.tensorize(observation, validate=False)
-                        commands[owner] = tuple(chosen) or (ActionV1.wait(owner, ticks=POLICY_DECISION_TICKS),)
-                    observations, _, terms, truncs, _ = environment.step(commands, record_trace=False)
-                    terminated, truncated = bool(terms["__all__"]), bool(truncs["__all__"])
-                    for observation in observations.values():
-                        for event in observation.events:
-                            if event.event_type == "action_rejected":
-                                rejected.add(json.dumps(event.to_dict(), sort_keys=True))
-                terminal = observations[0].terminal
+                sessions = []  # play_match ended them
+                terminal = outcome.terminal
+                terminated, truncated = outcome.terminated, outcome.truncated
                 winner = None if terminal.winner is None else ("a" if terminal.winner == a_owner else "b")
                 row = {
                     "game": index + 1,
@@ -125,17 +200,17 @@ def evaluate(
                     "winner": winner,
                     "terminated": terminated,
                     "truncated": truncated,
-                    "tick": observations[0].tick,
+                    "tick": outcome.tick,
                     "terminal": terminal.to_dict(),
-                    "actions_by_owner": actions,
-                    "rejected_actions": len(rejected),
+                    "actions_by_owner": outcome.actions_by_owner,
+                    "rejected_actions": outcome.rejected_actions,
+                    "first_action_tick_by_owner": outcome.first_action_tick_by_owner,
+                    "full_elixir_ticks_by_owner": outcome.full_elixir_ticks_by_owner,
+                    "forced_actions_by_owner": outcome.forced_actions_by_owner,
                 }
                 rows.append(row)
                 log.write(json.dumps(row) + "\n")
                 print(json.dumps(row), flush=True)
-                for session in sessions:
-                    session.end_episode()
-                sessions = []
         result = {
             "requested": games,
             "completed": len(rows),
@@ -145,6 +220,7 @@ def evaluate(
             "truncated": sum(r["truncated"] for r in rows),
         }
         (output / "summary.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+        (output / "report.json").write_text(json.dumps(build_report(rows), indent=2), encoding="utf-8")
         return result
     finally:
         for session in sessions:
@@ -164,6 +240,11 @@ def main(argv=None):
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--sample", action="store_true")
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--force-first-action-tick",
+        type=int,
+        help="force one action from a side that has not played by this tick (historical IL protocol: 300)",
+    )
     args = parser.parse_args(argv)
     config = json.loads(args.match_config.read_text(encoding="utf-8")) if args.match_config else {}
     for key in ("owner0_account_id", "owner1_account_id"):
@@ -180,6 +261,7 @@ def main(argv=None):
         port=args.port,
         device=args.device,
         sample=args.sample,
+        force_first_action_tick=args.force_first_action_tick,
     )
     return 0
 

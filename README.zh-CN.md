@@ -124,6 +124,8 @@ Copy-Item .env.example .env
 | [策略服务](docs/policy_service.md) | 循环策略的对局生命周期与请求协议 |
 | [兼容性数据](native_runner/data/competitive/README.md) | 卡牌支持、模型目录与版本维护 |
 | [检查指南](docs/validation.md) | 环境检查、测试命令与运行结果检查 |
+| [离线评估](docs/evaluation.md) | 镜像循环赛、置信区间、SPRT 晋级门与跨卡组泛化 |
+| [合规与路线图](docs/compliance_and_roadmap.md) | 离线边界、真实游戏适配限制与开发路线图 |
 
 ## 许可
 

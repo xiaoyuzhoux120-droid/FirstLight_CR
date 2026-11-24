@@ -125,6 +125,8 @@ Use `--games` for the match count, `--match-config` for decks and levels, and `-
 | [Policy service](docs/policy_service.md) | Recurrent episode lifecycle and request protocol |
 | [Compatibility data](native_runner/data/competitive/README.md) | Card support, model catalogs, and version maintenance |
 | [Checks](docs/validation.md) | Environment checks, tests, and runtime result checks |
+| [Offline evaluation](docs/evaluation.md) | Mirrored round-robin tournaments, confidence intervals, SPRT gating, per-deck generalization (Chinese) |
+| [Compliance and roadmap](docs/compliance_and_roadmap.md) | Offline-only boundary, real-game adaptation limits, development roadmap (Chinese) |
 
 ## License
 

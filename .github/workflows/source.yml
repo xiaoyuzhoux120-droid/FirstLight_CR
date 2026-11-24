@@ -15,4 +15,8 @@ jobs:
       - run: python -m pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
       - run: python -m pip install -r requirements.txt
       - run: python tools/check_install.py
-      - run: python -m pytest native_runner/tests/test_competitive_data.py native_runner/tests/test_card_specs_ruleset.py native_runner/tests/test_timeline.py native_runner/tests/test_training_v4_learning.py native_runner/tests/test_training_v4_cache.py native_runner/tests/test_evaluate_and_serve.py -q
+      # The whole suite runs on CPU in about 1.5 minutes. CUDA, PowerShell and
+      # original-APK checks skip themselves when their prerequisites are absent.
+      - run: python -m pytest native_runner/tests -q
+      - run: python -m pip install ruff==0.14.0
+      - run: python -m ruff check native_runner/training/v4/eval_stats.py native_runner/training/v4/tournament.py native_runner/training/v4/evaluate.py
