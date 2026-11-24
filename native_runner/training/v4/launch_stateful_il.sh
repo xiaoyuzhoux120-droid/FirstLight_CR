@@ -17,4 +17,6 @@ exec "${python_bin}" -m torch.distributed.run \
   --shards-per-rank "${CR_IL_SHARDS_PER_RANK:-1}" \
   --torch-threads "${CR_IL_TORCH_THREADS:-1}" \
   --save-every-groups "${CR_IL_SAVE_EVERY_GROUPS:-25}" \
+  --micro-batches "${CR_IL_MICRO_BATCHES:-1}" \
+  --prefetch-groups "${CR_IL_PREFETCH_GROUPS:-0}" \
   --no-validate "$@"

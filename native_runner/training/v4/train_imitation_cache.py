@@ -15,7 +15,7 @@ import time
 from typing import Mapping, Sequence, cast
 
 import torch
-from torch import Tensor, nn
+from torch import nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
@@ -34,12 +34,17 @@ from .factory import build_production_model_v4
 from .imitation import (
     DEFAULT_IL_DELAY_NEIGHBOR_WEIGHT,
     DEFAULT_IL_GATE_ACT_WEIGHT,
-    ILLossV4,
     ILLossWeightsV4,
     ILSequenceV4,
-    imitation_loss,
 )
 from .learning import RecurrentEvaluationV4, evaluate_recurrent_sequence
+from .microbatch import (
+    PrefetchIterator,
+    grad_scaler_for,
+    micro_batched_il_backward,
+    module_no_sync,
+    resolve_dist_backend,
+)
 from .model import UniversalCardPolicyV4
 from .tensors import RecurrentPolicyStateV4
 
@@ -255,46 +260,6 @@ def _masked_chunk(
     return sequence, sum(active_steps)
 
 
-_LOSS_HEADS = (
-    ("gate", "gate_count"),
-    ("candidate", "candidate_count"),
-    ("target", "target_count"),
-    ("delay", "delay_count"),
-    ("continue_action", "continue_count"),
-    ("value", "value_count"),
-)
-
-
-def _distributed_loss(
-    losses: ILLossV4, weights: ILLossWeightsV4, *, world_size: int
-) -> tuple[Tensor, dict[str, float]]:
-    total = losses.total * 0.0
-    metrics: dict[str, float] = {}
-    local_counts = torch.stack(
-        [getattr(losses, count_name).detach().to(torch.float32) for _loss_name, count_name in _LOSS_HEADS]
-    )
-    local_sums = torch.stack(
-        [
-            getattr(losses, loss_name).detach().to(torch.float32) * local_counts[index]
-            for index, (loss_name, _count_name) in enumerate(_LOSS_HEADS)
-        ]
-    )
-    global_stats = torch.cat((local_counts, local_sums))
-    dist.all_reduce(global_stats, op=dist.ReduceOp.SUM)
-    global_counts, global_sums = global_stats.chunk(2)
-    for index, (loss_name, count_name) in enumerate(_LOSS_HEADS):
-        local_loss = getattr(losses, loss_name)
-        local_count = local_counts[index]
-        global_count = global_counts[index]
-        count_value = float(global_count.item())
-        metrics[loss_name] = float((global_sums[index] / global_count).item()) if count_value else 0.0
-        metrics[count_name] = count_value
-        if count_value:
-            scale = local_count * float(world_size) / global_count
-            total = total + getattr(weights, loss_name) * local_loss * scale
-    return total, metrics
-
-
 def _broadcast_training_plan(
     rank: int, index_paths: Sequence[Path], train_tags_path: Path, manifest_workers: int
 ) -> tuple[tuple[ShardTrainingPlanV1, ...], dict[str, object]]:
@@ -361,6 +326,20 @@ def main() -> None:
     parser.add_argument("--autocast", choices=("none", "bfloat16", "float16"), default="bfloat16")
     parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--preencode-observations", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--micro-batches",
+        type=int,
+        default=1,
+        help="split each rank's TBPTT chunk into this many sequential forward/backward passes; "
+        "same gradient as one pass, lower peak activation memory (use on 8-12 GB GPUs)",
+    )
+    parser.add_argument(
+        "--prefetch-groups",
+        type=int,
+        default=0,
+        help="load this many upcoming cache groups on a background thread while training (host RAM cost)",
+    )
+    parser.add_argument("--dist-backend", choices=("auto", "nccl", "gloo"), default="auto")
     args = parser.parse_args()
     positive = (
         args.epochs,
@@ -376,8 +355,9 @@ def main() -> None:
         args.log_every,
         args.save_every_groups,
         args.expected_world_size,
+        args.micro_batches,
     )
-    if any(value <= 0 for value in positive) or args.weight_decay < 0:
+    if any(value <= 0 for value in positive) or args.weight_decay < 0 or args.prefetch_groups < 0:
         raise ValueError("training counts and rates must be positive")
     if not 0.0 <= args.delay_neighbor_weight <= 1.0 / 3.0:
         raise ValueError("delay neighbor weight must be in [0, 1/3]")
@@ -389,7 +369,11 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
-    dist.init_process_group(backend="nccl", device_id=device)
+    backend = resolve_dist_backend(args.dist_backend, device)
+    if backend == "nccl":
+        dist.init_process_group(backend="nccl", device_id=device)
+    else:  # Windows / single consumer GPU: NCCL is not shipped there
+        dist.init_process_group(backend=backend)
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     if world_size != args.expected_world_size:
@@ -435,6 +419,7 @@ def main() -> None:
     )
     weights = ILLossWeightsV4()
     autocast_dtype = _autocast_dtype(args.autocast)
+    scaler = grad_scaler_for(autocast_dtype, device)
     parameter_count = sum(parameter.numel() for parameter in policy.parameters())
     total_owner_frames = int(dataset_metadata["selected_owner_frames"])
     log_path = output_dir / "train-metrics.jsonl"
@@ -452,6 +437,10 @@ def main() -> None:
             "autocast": args.autocast,
             "validate": args.validate,
             "preencode_observations": args.preencode_observations,
+            "micro_batches": args.micro_batches,
+            "prefetch_groups": args.prefetch_groups,
+            "dist_backend": backend,
+            "grad_scaler": scaler is not None,
             "learning_rate": args.learning_rate,
             "weight_decay": args.weight_decay,
             "gate_act_weight": args.gate_act_weight,
@@ -507,17 +496,30 @@ def main() -> None:
             if args.max_groups is not None:
                 groups = groups[: args.max_groups]
             epoch_first_group = start_group if epoch == start_epoch else 0
+            local_start = rank * args.shards_per_rank
+            epoch_local_plans: list[tuple[ShardTrainingPlanV1, ...]] = []
+            for group_index in range(epoch_first_group, len(groups)):
+                local_plans = groups[group_index][local_start : local_start + args.shards_per_rank]
+                if not local_plans:
+                    source = plans[0]
+                    local_plans = (ShardTrainingPlanV1(summary_path=source.summary_path, units=(source.units[0],)),)
+                epoch_local_plans.append(local_plans)
+            loaded_groups = iter(
+                PrefetchIterator(
+                    epoch_local_plans,
+                    lambda item: load_il_cache_shards(
+                        [plan.summary_path for plan in cast(tuple[ShardTrainingPlanV1, ...], item)],
+                        workers=args.load_workers,
+                    ),
+                    depth=args.prefetch_groups,
+                )
+            )
             for group_index in range(epoch_first_group, len(groups)):
                 global_group = groups[group_index]
-                local_start = rank * args.shards_per_rank
-                local_plans = global_group[local_start : local_start + args.shards_per_rank]
-                dummy = not local_plans
-                if dummy:
-                    source = plans[0]
-                    unit = source.units[0]
-                    local_plans = (ShardTrainingPlanV1(summary_path=source.summary_path, units=(unit,)),)
+                local_plans = epoch_local_plans[group_index - epoch_first_group]
+                dummy = not global_group[local_start : local_start + args.shards_per_rank]
                 cache_started = time.perf_counter()
-                shards = load_il_cache_shards([plan.summary_path for plan in local_plans], workers=args.load_workers)
+                shards = next(loaded_groups)
                 cache_load_s = time.perf_counter() - cache_started
                 local_dropped = sum(
                     int(
@@ -551,32 +553,46 @@ def main() -> None:
                         dummy=dummy,
                     )
                     optimizer.zero_grad(set_to_none=True)
-                    with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_dtype is not None):
-                        evaluation = ddp(
-                            sequence, state, validate=args.validate, preencode_observations=args.preencode_observations
-                        )
-                        losses = imitation_loss(
-                            sequence,
-                            evaluation,
-                            weights=weights,
-                            gate_act_weight=args.gate_act_weight,
-                            delay_neighbor_weight=args.delay_neighbor_weight,
-                        )
-                        loss, last_metrics = _distributed_loss(losses, weights, world_size=world_size)
-                    finite = torch.tensor(int(bool(torch.isfinite(loss).all())), device=device, dtype=torch.int32)
+                    step = micro_batched_il_backward(
+                        lambda item, item_state: ddp(
+                            item,
+                            item_state,
+                            validate=args.validate,
+                            preencode_observations=args.preencode_observations,
+                        ),
+                        sequence,
+                        state,
+                        micro_batches=args.micro_batches,
+                        weights=weights,
+                        world_size=world_size,
+                        all_reduce_sum=lambda value: dist.all_reduce(value, op=dist.ReduceOp.SUM),
+                        no_sync=module_no_sync(ddp),
+                        autocast_dtype=autocast_dtype,
+                        scaler=scaler,
+                        gate_act_weight=args.gate_act_weight,
+                        delay_neighbor_weight=args.delay_neighbor_weight,
+                    )
+                    last_metrics = step.metrics
+                    finite = torch.tensor(int(step.finite), device=device, dtype=torch.int32)
                     dist.all_reduce(finite, op=dist.ReduceOp.MIN)
-                    if not int(finite.item()):
+                    if not int(finite.item()) and scaler is None:
                         raise FloatingPointError(
                             f"non-finite distributed IL loss at epoch={epoch} group={group_index} chunk={chunk_index}"
                         )
-                    loss.backward()
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
                     grad_norm = nn.utils.clip_grad_norm_(ddp.parameters(), args.max_grad_norm)
-                    if not bool(torch.isfinite(grad_norm)):
-                        raise FloatingPointError(
-                            f"non-finite gradient at epoch={epoch} group={group_index} chunk={chunk_index}"
-                        )
-                    optimizer.step()
-                    state = evaluation.final_state.detach()
+                    if scaler is not None:
+                        # FP16: GradScaler skips the step and lowers the scale on overflow.
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        if not bool(torch.isfinite(grad_norm)):
+                            raise FloatingPointError(
+                                f"non-finite gradient at epoch={epoch} group={group_index} chunk={chunk_index}"
+                            )
+                        optimizer.step()
+                    state = step.final_state
                     update_step += 1
                     frame_tensor = torch.tensor(local_frames, device=device, dtype=torch.long)
                     dist.all_reduce(frame_tensor, op=dist.ReduceOp.SUM)

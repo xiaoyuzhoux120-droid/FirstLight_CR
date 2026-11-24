@@ -1,6 +1,6 @@
 # Training and simulation
 
-[English home](../README.md) · [Installation](getting_started.md) · [Training history](training_history.md)
+[English home](../README.md) · [Installation](getting_started.md) · [Training history](training_history.md) · [RTX 4060/4070 单卡指南](training_rtx4060_4070.zh-CN.md)
 
 Run commands from the repository root with the Python dependencies installed. Windows supports cache building, inference, evaluation, and the console. The IL/PPO launchers target Linux with CUDA and NCCL.
 
